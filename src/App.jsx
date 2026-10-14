@@ -28,6 +28,8 @@ const dateTime = (value) => value ? new Intl.DateTimeFormat('en-IN', { day: 'num
 const day = (value) => value ? new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(value)) : '—';
 const sameDay = (value) => new Date(value).toDateString() === new Date().toDateString();
 const isOverdue = (item) => item.status === 'Open' && new Date(item.dueDate) < new Date(new Date().setHours(0, 0, 0, 0));
+const LOCATION_HEARTBEAT_MS = 60_000;
+const GEOLOCATION_OPTIONS = { enableHighAccuracy: true, maximumAge: 15_000, timeout: 20_000 };
 function gpsDistanceKm(first, second) {
   const firstCoordinates = first?.location?.coordinates;
   const secondCoordinates = second?.location?.coordinates;
@@ -73,7 +75,11 @@ function App() {
   const [locationState, setLocationState] = useState('Waiting for location consent');
   const [sharingLocation, setSharingLocation] = useState(false);
   const locationWatch = useRef(null);
-    const [currentLocation, setCurrentLocation] = useState(null);
+  const locationHeartbeat = useRef(null);
+  const locationVisibilityHandler = useRef(null);
+  const locationPostInFlight = useRef(false);
+  const locationTracking = useRef(false);
+  const [currentLocation, setCurrentLocation] = useState(null);
   const [globalSearch, setGlobalSearch] = useState('');
 
   const token = session?.token;
@@ -99,7 +105,29 @@ function App() {
     finally { setLoading(false); }
   }
 
+  function clearLocationTracking() {
+    if (locationWatch.current !== null) navigator.geolocation?.clearWatch(locationWatch.current);
+    if (locationHeartbeat.current !== null) window.clearInterval(locationHeartbeat.current);
+    if (locationVisibilityHandler.current) document.removeEventListener('visibilitychange', locationVisibilityHandler.current);
+    locationWatch.current = null;
+    locationHeartbeat.current = null;
+    locationVisibilityHandler.current = null;
+    locationTracking.current = false;
+  }
+
+  function handleLocationError(error) {
+    if (error?.code === 1) {
+      clearLocationTracking();
+      setSharingLocation(false);
+      setLocationState('Location access is off');
+      return;
+    }
+    setLocationState('Live tracking is waiting for a GPS update');
+  }
+
   async function postLocation(position) {
+    if (!locationTracking.current || locationPostInFlight.current) return;
+    locationPostInFlight.current = true;
     try {
       const { latitude, longitude, accuracy } = position.coords;
       const savedLocation = await request('/locations/ping', { method: 'POST', body: { latitude, longitude, accuracy } });
@@ -109,22 +137,38 @@ function App() {
         const distanceFromPreviousKm = previous ? gpsDistanceKm(previous, savedLocation) : null;
         return [{ ...savedLocation, user: { _id: user.id, name: user.name }, distanceFromPreviousKm }, ...current].slice(0, 10000);
       });
-        setCurrentLocation({ latitude, longitude, recordedAt: new Date().toISOString() });
+      setCurrentLocation({ latitude, longitude, recordedAt: new Date().toISOString() });
       request('/dashboard/suggestions').then(setSuggestions).catch(() => {});
       setSharingLocation(true);
       setLocationState('Live location active');
-    } catch (error) { setLocationState(`Location save failed: ${error.message || 'Check your connection and try again.'}`); }
+    } catch (error) {
+      setLocationState(`Location save failed: ${error.message || 'Check your connection and try again.'}`);
+    } finally {
+      locationPostInFlight.current = false;
+    }
   }
+
+  function refreshLocation() {
+    if (!locationTracking.current || !navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(postLocation, handleLocationError, GEOLOCATION_OPTIONS);
+  }
+
   function startLocation() {
     if (!navigator.geolocation) return setLocationState('Location is not supported by this browser');
-    if (locationWatch.current !== null) navigator.geolocation.clearWatch(locationWatch.current);
+    clearLocationTracking();
+    locationTracking.current = true;
     setSharingLocation(true);
     setLocationState('Checking your location…');
-    locationWatch.current = navigator.geolocation.watchPosition(postLocation, () => { setSharingLocation(false); setLocationState('Location access is off'); }, { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 });
+    locationWatch.current = navigator.geolocation.watchPosition(postLocation, handleLocationError, GEOLOCATION_OPTIONS);
+    locationHeartbeat.current = window.setInterval(refreshLocation, LOCATION_HEARTBEAT_MS);
+    locationVisibilityHandler.current = () => {
+      if (!document.hidden) refreshLocation();
+    };
+    document.addEventListener('visibilitychange', locationVisibilityHandler.current);
+    refreshLocation();
   }
   function stopLocation() {
-    if (locationWatch.current !== null) navigator.geolocation.clearWatch(locationWatch.current);
-    locationWatch.current = null;
+    clearLocationTracking();
     setSharingLocation(false);
     setLocationState('Location sharing paused');
   }
@@ -136,15 +180,14 @@ function App() {
       return () => window.clearInterval(interval);
     }
     startLocation();
-    return () => { if (locationWatch.current !== null) navigator.geolocation?.clearWatch(locationWatch.current); locationWatch.current = null; };
+    return () => clearLocationTracking();
   }, [token, user?.role]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const searchedCustomers = useMemo(() => !globalSearch ? customers : customers.filter((customer) => [customer.company, customer.contactName, customer.city].join(' ').toLowerCase().includes(globalSearch.toLowerCase())), [customers, globalSearch]);
   const todayCount = followUps.filter((item) => sameDay(item.dueDate) && item.status === 'Open').length;
 
   async function signOut() {
-    if (locationWatch.current !== null) navigator.geolocation?.clearWatch(locationWatch.current);
-    locationWatch.current = null;
+    clearLocationTracking();
     if (user.role === 'sales') {
       await request('/locations/stop', { method: 'POST', body: { clearHistory: true } }).catch(() => {});
       setSharingLocation(false);
